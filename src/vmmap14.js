@@ -1,6 +1,6 @@
 'use strict';
 
-const { loadAst, loc, walkAst, unwrapGroup } = require('./vmmap');
+const { loadAst, loc, walkAst, walkAstPrune, walkWithContext, chainToArray, unwrapGroup } = require('./vmmap');
 
 function unwrap(e) {
   while (e && (e.type === 'AstExprGroup' || e.type === 'AstExprTypeAssertion')) e = e.expr;
@@ -83,21 +83,19 @@ function resolve(tree, varName, value) {
   }
 }
 
+// Penelusuran iteratif (AST obfuscation bisa sangat dalam -> rekursi bisa stack overflow)
 function declsIn(fn) {
   const keys = {};
-  function visit(n) {
-    if (!n || typeof n !== 'object') return;
-    if (Array.isArray(n)) { n.forEach(visit); return; }
+  (fn.args || []).forEach((a) => { keys[a.location] = a.name; });
+  walkAstPrune(fn.body, (n) => {
     const t = n.type;
-    if (t === 'AstExprFunction' && n !== fn) return;
+    if (t === 'AstExprFunction' && n !== fn) return false; // jangan masuk fungsi bersarang
     if (t === 'AstStatLocal') (n.vars || []).forEach((v) => { keys[v.location] = v.name; });
     else if (t === 'AstStatLocalFunction') keys[n.name.location] = n.name.name;
     else if (t === 'AstStatFor') keys[n.var.location] = n.var.name;
     else if (t === 'AstStatForIn') (n.vars || []).forEach((v) => { keys[v.location] = v.name; });
-    Object.values(n).forEach(visit);
-  }
-  (fn.args || []).forEach((a) => { keys[a.location] = a.name; });
-  visit(fn.body);
+    return undefined;
+  });
   return keys;
 }
 
@@ -159,6 +157,16 @@ function selectVmFactory(stack, stmts, disp) {
   return null;
 }
 
+// Perbandingan tuple numerik (array dibandingkan dengan > di JS diubah jadi string:
+// [16,4,-1] > [8,0,-2] bernilai false). Python memakai tuple, jadi ini yang benar.
+function cmpTuple(a, b) {
+  for (let i = 0; i < a.length; i++) {
+    const x = +a[i], y = +b[i];
+    if (x !== y) return x > y ? 1 : -1;
+  }
+  return 0;
+}
+
 function makerParams(maker) {
   const args = maker.args || [];
   if (!args.length) return [0, 0];
@@ -166,9 +174,7 @@ function makerParams(maker) {
   args.forEach((a, i) => { visible[a.name] = i; });
   const direct = {}, nested = {}, used = new Set();
 
-  function visit(n) {
-    if (!n || typeof n !== 'object') return;
-    if (Array.isArray(n)) { n.forEach(visit); return; }
+  walkAst(maker.body, (n) => {
     if (n.type === 'AstExprLocal') used.add(n.local.location);
     if (n.type === 'AstExprIndexExpr') {
       const base = unwrap(n.expr);
@@ -182,20 +188,18 @@ function makerParams(maker) {
         }
       }
     }
-    Object.values(n).forEach(visit);
-  }
-  visit(maker.body);
+  });
 
   const candidates = Object.values(visible);
   const score = (i) => [(nested[args[i].location] || 0) + (direct[args[i].location] || 0), direct[args[i].location] || 0, -i];
-  let pi = candidates.length ? candidates.reduce((best, i) => (score(i) > score(best) ? i : best), candidates[0]) : 0;
+  const pi = candidates.length ? candidates.reduce((best, i) => (cmpTuple(score(i), score(best)) > 0 ? i : best), candidates[0]) : 0;
   const remaining = candidates.filter((i) => i !== pi);
   let ui = pi;
   if (remaining.length) {
     ui = remaining.reduce((best, i) => {
       const bs = [used.has(args[best].location), direct[args[best].location] || 0, -best];
       const is_ = [used.has(args[i].location), direct[args[i].location] || 0, -i];
-      return is_ > bs ? i : best;
+      return cmpTuple(is_, bs) > 0 ? i : best;
     }, remaining[0]);
   }
   return [pi, ui];
@@ -204,16 +208,12 @@ function makerParams(maker) {
 function captures(info) {
   const makerDecls = declsIn(info.maker);
   const used = {};
-  function visit(n) {
-    if (!n || typeof n !== 'object') return;
-    if (Array.isArray(n)) { n.forEach(visit); return; }
+  walkAst(info.vm, (n) => {
     if (n.type === 'AstExprLocal') {
       const k = n.local.location;
       if (makerDecls[k]) used[k] = makerDecls[k];
     }
-    Object.values(n).forEach(visit);
-  }
-  visit(info.vm);
+  });
   const names = {};
   Object.entries(used).forEach(([k, name]) => { (names[name] = names[name] || []).push(k); });
   const dup = new Set(Object.entries(names).filter(([, ks]) => ks.length > 1).map(([nm]) => nm));
@@ -225,16 +225,12 @@ function captures(info) {
 function outerEnv(info) {
   const own = new Set(Object.keys(declsIn(info.maker)));
   const found = {};
-  function visit(n) {
-    if (!n || typeof n !== 'object') return;
-    if (Array.isArray(n)) { n.forEach(visit); return; }
+  walkAst(info.maker.body, (n) => {
     if (n.type === 'AstExprLocal') {
       const key = n.local.location;
       if (!own.has(key) && n.local.name) found[key] = n.local.name;
     }
-    Object.values(n).forEach(visit);
-  }
-  visit(info.maker.body);
+  });
   const byName = {};
   Object.entries(found).forEach(([key, name]) => { (byName[name] = byName[name] || []).push(key); });
   const out = [];
@@ -248,67 +244,59 @@ function outerEnv(info) {
   return out;
 }
 
-function closureEntries(root) {
-  const byNode = new Map(findDispatchers(root).map((d) => [d.node, d]));
-  const seen = new Map();
-  function walk(n, stack, stmts) {
-    if (!n || typeof n !== 'object') return;
-    if (Array.isArray(n)) { n.forEach((v) => walk(v, stack, stmts)); return; }
+// Cache daftar dispatcher per root (closureEntries & makerInfo sama-sama memakainya)
+const _dispMapCache = new WeakMap();
+function dispMap(root) {
+  let m = _dispMapCache.get(root);
+  if (!m) { m = new Map(findDispatchers(root).map((d) => [d.node, d])); _dispMapCache.set(root, m); }
+  return m;
+}
+
+// Panggil onDisp(dispatcher, stack, stmts) untuk tiap dispatcher. stack = fungsi leluhur
+// (terluar -> terdalam); stmts = [[statement, kedalaman]] dengan kedalaman = jumlah fungsi leluhur + 1.
+function forEachDispatcher(root, onDisp) {
+  const byNode = dispMap(root);
+  walkWithContext(root, (n, fns, sts) => {
     const t = n.type;
-    let st = stack, sm = stmts;
-    if (t === 'AstExprFunction') { st = [...stack, n]; sm = stmts; }
-    if (t && t.startsWith('AstStat')) sm = [...stmts, [n, stack.length + 1]];
-    if ((t === 'AstStatWhile' || t === 'AstStatRepeat') && byNode.has(n)) {
-      const picked = selectVmFactory(st, sm, byNode.get(n));
-      if (picked) {
-        const [, maker, vm] = picked;
-        const body = (vm.body || {}).body || [];
-        if (body.length) {
-          const [l1, c1] = loc(body[0]);
-          const [pi] = makerParams(maker);
-          if (maker.args && pi < maker.args.length) seen.set(`${l1},${c1}`, maker.args[pi].name);
-        }
-      }
-    }
-    Object.values(n).forEach((v) => walk(v, st, sm));
-  }
-  walk(root, [], []);
+    if (!((t === 'AstStatWhile' || t === 'AstStatRepeat') && byNode.has(n))) return;
+    onDisp(byNode.get(n), chainToArray(fns).map((x) => x.node), chainToArray(sts).map((s) => [s.node, s.fnDepth + 1]));
+  });
+}
+
+function closureEntries(root) {
+  const seen = new Map();
+  forEachDispatcher(root, (disp, stack, stmts) => {
+    const picked = selectVmFactory(stack, stmts, disp);
+    if (!picked) return;
+    const [, maker, vm] = picked;
+    const body = (vm.body || {}).body || [];
+    if (!body.length) return;
+    const [l1, c1] = loc(body[0]);
+    const [pi] = makerParams(maker);
+    if (maker.args && pi < maker.args.length) seen.set(`${l1},${c1}`, maker.args[pi].name);
+  });
   return [...seen.entries()].map(([k, name]) => { const [l, c] = k.split(',').map(Number); return [l, c, name]; });
 }
 
 function makerInfo(root) {
-  const byNode = new Map(findDispatchers(root).map((d) => [d.node, d]));
   const out = new Map();
-  function walk(n, stack, stmts) {
-    if (!n || typeof n !== 'object') return;
-    if (Array.isArray(n)) { n.forEach((v) => walk(v, stack, stmts)); return; }
-    const t = n.type;
-    let st = stack, sm = stmts;
-    if (t === 'AstExprFunction') { st = [...stack, n]; }
-    if (t && t.startsWith('AstStat')) sm = [...stmts, [n, stack.length + 1]];
-    if ((t === 'AstStatWhile' || t === 'AstStatRepeat') && byNode.has(n)) {
-      const disp = byNode.get(n);
-      const picked = selectVmFactory(st, sm, disp);
-      if (picked) {
-        const [mi, maker, clo, stBind, varName] = picked;
-        const [, , l2, c2] = loc(stBind);
-        const key = `${l2},${c2}`;
-        if (!out.has(key)) {
-          const [pi, ui] = makerParams(maker);
-          if (maker.args && pi < maker.args.length) {
-            out.set(key, {
-              at: [l2, c2], var: varName,
-              proto: maker.args[pi].name, protoIndex: pi, upvalsIndex: ui,
-              pfKey: maker.args[pi].name, maker, vm: clo, stmt: stBind,
-              makerDepth: mi, dispatchPc: disp.pc, dispatchArr: disp.arr,
-            });
-          }
-        }
-      }
+  forEachDispatcher(root, (disp, stack, stmts) => {
+    const picked = selectVmFactory(stack, stmts, disp);
+    if (!picked) return;
+    const [mi, maker, clo, stBind, varName] = picked;
+    const [, , l2, c2] = loc(stBind);
+    const key = `${l2},${c2}`;
+    if (out.has(key)) return;
+    const [pi, ui] = makerParams(maker);
+    if (maker.args && pi < maker.args.length) {
+      out.set(key, {
+        at: [l2, c2], var: varName,
+        proto: maker.args[pi].name, protoIndex: pi, upvalsIndex: ui,
+        pfKey: maker.args[pi].name, maker, vm: clo, stmt: stBind,
+        makerDepth: mi, dispatchPc: disp.pc, dispatchArr: disp.arr,
+      });
     }
-    Object.values(n).forEach((v) => walk(v, st, sm));
-  }
-  walk(root, [], []);
+  });
   const results = [...out.values()];
   results.forEach((info) => {
     info.captures = captures(info);
@@ -321,14 +309,22 @@ function patchEntries(source, filePath, chunkTag) {
   const root = loadAst(filePath);
   const lines = source.split('\n');
   const edits = [];
-  for (const [l1, c1, pv] of closureEntries(root)) {
+  const entries = closureEntries(root);
+  const makers = makerInfo(root);
+  // Diagnosa: 0 hook = bentuk dispatcher v14 tidak dikenali -> proto tidak tertangkap ("0 functions")
+  if (!entries.length && !makers.length) {
+    process.stderr.write('[!] vmmap14: dispatcher VM tidak dikenali (0 hook); capture proto kemungkinan kosong\n');
+  } else if (process.env.DEOB_VERBOSE) {
+    process.stderr.write(`[*] vmmap14: ${entries.length} entry hook, ${makers.length} maker hook\n`);
+  }
+  for (const [l1, c1, pv] of entries) {
     const k = `(${pv} or __PID)`;
     edits.push([l1, c1,
       `if not __PID[${k}] then __PID.n=__PID.n+1;__PID[${k}]=__PID.n;end;` +
       `__ENT.n=__ENT.n+1;__ENT[__ENT.n%64]=__PID[${k}];__PLAST[__PID[${k}]]=__ENT.n;` +
       `if __SKIPP[__PID[${k}]] then return end;`]);
   }
-  for (const info of makerInfo(root)) {
+  for (const info of makers) {
     const [l2, c2] = info.at;
     const pv = info.proto;
     const v = info.var;
@@ -342,6 +338,7 @@ function patchEntries(source, filePath, chunkTag) {
   }
   edits.sort((a, b) => (b[0] !== a[0] ? b[0] - a[0] : b[1] - a[1]));
   for (const [l, c, code] of edits) {
+    if (lines[l] === undefined) continue; // lokasi di luar source: lewati, jangan crash
     lines[l] = lines[l].slice(0, c) + code + lines[l].slice(c);
   }
   return lines.join('\n');
